@@ -21,10 +21,12 @@ from logging import getLogger
 
 import numpy as np
 from pykdtree.kdtree import KDTree
+from pyproj import CRS
 
 from pyresample import CHUNK_SIZE, geometry
 from pyresample.utils.errors import PerformanceWarning
 
+from ...utils.proj4 import DaskFriendlyTransformer
 from ..geometry import StaticGeometry, SwathDefinition
 from ._transform_utils import lonlat2xyz
 from .resampler import Resampler, update_resampled_coords
@@ -53,7 +55,6 @@ def query_no_distance(target_lons, target_lats,
     if mask is not None:
         mask = mask.ravel()
 
-    # TODO: Convert between CRSes
     coords = lonlat2xyz(target_lons.ravel(), target_lats.ravel())
     distance_array, index_array = kdtree.query(
         coords,
@@ -71,7 +72,75 @@ def query_no_distance(target_lons, target_lats,
     # index_array is 2D (valid output pixels, neighbors)
     res_ia = index_array.astype(int, copy=False)  # usually a copy since pykdtree creates uint32/64 indexes
     res_ia[res_ia >= kdtree.n] = -1
+    print(res_ia.shape, target_lons.shape, coords.shape, neighbours)
     return res_ia.reshape(target_lons.shape + (neighbours,))
+
+
+def _query_no_distance_xyz(
+        coords,
+        mask=None,
+        neighbours=None, epsilon=None, radius=None,
+        kdtree=None
+):
+    """Query the kdtree. No distances are returned.
+
+    NOTE: Dask array arguments must always come before other keyword arguments
+          for `da.blockwise` arguments to work.
+    """
+    if mask is not None:
+        mask = mask.ravel()
+
+    distance_array, index_array = kdtree.query(
+        coords.reshape((-1, 3)),
+        k=neighbours,
+        eps=epsilon,
+        distance_upper_bound=radius,
+        mask=mask)
+
+    if index_array.ndim == 1:
+        index_array = index_array[:, None]
+
+    # KDTree query returns out-of-bounds neighbors as `len(arr)`
+    # which is an invalid index, we mask those out so -1 represents
+    # invalid values
+    # index_array is 2D (valid output pixels, neighbors)
+    res_ia = index_array.astype(int, copy=False)  # usually a copy since pykdtree creates uint32/64 indexes
+    res_ia[res_ia >= kdtree.n] = -1
+    return res_ia.reshape(coords.shape[:-1] + (neighbours,))
+
+
+def _query_no_distance_xyz2(
+        coords_x, coords_y, coords_z,
+        mask=None,
+        neighbours=None, epsilon=None, radius=None,
+        kdtree=None
+):
+    """Query the kdtree. No distances are returned.
+
+    NOTE: Dask array arguments must always come before other keyword arguments
+          for `da.blockwise` arguments to work.
+    """
+    if mask is not None:
+        mask = mask.ravel()
+
+    coords = np.stack((coords_x.ravel(), coords_y.ravel(), coords_z.ravel()), axis=-1)
+    distance_array, index_array = kdtree.query(
+        coords,
+        k=neighbours,
+        eps=epsilon,
+        distance_upper_bound=radius,
+        mask=mask)
+
+    if index_array.ndim == 1:
+        index_array = index_array[:, None]
+
+    # KDTree query returns out-of-bounds neighbors as `len(arr)`
+    # which is an invalid index, we mask those out so -1 represents
+    # invalid values
+    # index_array is 2D (valid output pixels, neighbors)
+    res_ia = index_array.astype(int, copy=False)  # usually a copy since pykdtree creates uint32/64 indexes
+    res_ia[res_ia >= kdtree.n] = -1
+    return res_ia.reshape(coords_x.shape + (neighbours,))
 
 
 def _my_index(index_arr, data_arr, ia_slices=None, fill_value=np.nan):
@@ -114,6 +183,10 @@ class KDTreeNearestXarrayResampler(Resampler):
         self._internal_cache: dict[tuple, dict] = {}
         if self.target_geo_def.ndim != 2:
             raise ValueError("Target area definition must be 2 dimensions")
+        self._geocentric_crs = CRS.from_proj4("+proj=geocent +datum=WGS84 +units=m +no_defs +type=crs")
+        # TODO: CoordinateDefinition doesn't have a CRS property
+        self._src_geocentric_trans = DaskFriendlyTransformer.from_crs(self.source_geo_def.crs, self._geocentric_crs)  # type: ignore[union-attr]
+        self._dst_geocentric_trans = DaskFriendlyTransformer.from_crs(self.target_geo_def.crs, self._geocentric_crs)  # type: ignore[union-attr]
 
     @property
     def version(self) -> str:
@@ -143,19 +216,29 @@ class KDTreeNearestXarrayResampler(Resampler):
 
     def _create_resample_kdtree(self, chunks=CHUNK_SIZE):
         """Set up kd tree on input."""
-        source_lons, source_lats = self.source_geo_def.get_lonlats(
-            chunks=chunks)
-        input_coords = lonlat2xyz(source_lons, source_lats)
+        try:
+            input_coords = self.source_geo_def.get_proj_coords(dtype=np.float64, chunks=chunks)
+        except AttributeError:
+            # swath def - don't copy
+            input_coords = (self.source_geo_def.lons, self.source_geo_def.lats)
+        # don't pass DataArrays, pass dask
+        if isinstance(input_coords[0], DataArray):
+            input_coords = tuple(ic.data for ic in input_coords)
+        if len(input_coords) != 3:
+            input_coords += (da.zeros_like(input_coords[0]),)
+        input_coords = self._src_geocentric_trans.transform(*input_coords)
 
         # Build kd-tree on input
-        input_coords = input_coords.astype(np.float64, copy=False)
+        input_coords = np.stack(
+            tuple(ic.astype(np.float64, copy=False).ravel() for ic in input_coords),
+            axis=-1,
+        )
         delayed_kdtree = dask.delayed(KDTree, pure=True)(input_coords)
         return delayed_kdtree
 
     def _query_resample_kdtree(self,
                                resample_kdtree,
-                               tlons,
-                               tlats,
+                               output_coords,
                                mask,
                                neighbors,
                                radius_of_influence,
@@ -168,9 +251,12 @@ class KDTreeNearestXarrayResampler(Resampler):
             dims = 'mn'[:ndims]
             args = (mask, dims, dims)
         # res.shape = rows, cols, neighbors
-        # j=rows, i=cols, k=neighbors, m=source rows, n=source cols
+        # j=rows, i=cols, k=neighbors, m=source rows, n=source cols, l=3 (XYZ)
         res = da.blockwise(
-            query_no_distance, 'jik', tlons, 'ji', tlats, 'ji',
+            _query_no_distance_xyz2, 'jik',
+            output_coords[0], 'ji',
+            output_coords[1], 'ji',
+            output_coords[2], 'ji',
             *args, kdtree=resample_kdtree,
             neighbours=neighbors, epsilon=epsilon,
             radius=radius_of_influence, dtype=np.int64,
@@ -195,15 +281,25 @@ class KDTreeNearestXarrayResampler(Resampler):
         chunks = mask.chunks if mask is not None else CHUNK_SIZE
         resample_kdtree = self._create_resample_kdtree(chunks=chunks)
 
-        # TODO: Add 'chunks' keyword argument to this method and use it
-        target_lons, target_lats = self.target_geo_def.get_lonlats(chunks=CHUNK_SIZE)
+        try:
+            output_coords = self.target_geo_def.get_proj_coords(dtype=np.float64, chunks=chunks)
+        except AttributeError:
+            # swath def - don't copy
+            output_coords = (self.target_geo_def.lons, self.target_geo_def.lats)
+        # don't pass DataArrays, pass dask
+        if isinstance(output_coords[0], DataArray):
+            output_coords = tuple(ic.data for ic in output_coords)
+        if len(output_coords) != 3:
+            output_coords += (da.zeros_like(output_coords[0]),)
+        output_coords = self._dst_geocentric_trans.transform(*output_coords)
+        output_coords = tuple(oc.astype(np.float64, copy=False) for oc in output_coords)
 
         if mask is not None:
             if mask.shape != self.source_geo_def.shape:
                 raise ValueError("'mask' must be the same shape as the source geo definition")
             mask = mask.data
         index_arr = self._query_resample_kdtree(
-            resample_kdtree, target_lons, target_lats,
+            resample_kdtree, output_coords,
             mask,
             neighbors, radius_of_influence, epsilon)
 
