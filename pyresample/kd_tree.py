@@ -1098,6 +1098,7 @@ class XArrayResamplerNN(object):
             coord_x, coord_y = self.target_geo_def.get_proj_vectors()
             coords['y'] = coord_y
             coords['x'] = coord_x
+            # FIXME: Need to add units
         except AttributeError:
             logger.debug("No geo coordinates created")
 

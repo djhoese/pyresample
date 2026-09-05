@@ -51,8 +51,8 @@ class BaseResampler:
     """Base abstract resampler class."""
 
     def __init__(self,
-                 source_geo_def: Union[SwathDefinition, AreaDefinition],
-                 target_geo_def: Union[CoordinateDefinition, AreaDefinition],
+                 source_geo_def: SwathDefinition | AreaDefinition,
+                 target_geo_def: CoordinateDefinition | AreaDefinition,
                  ):
         """Initialize resampler with geolocation information.
 

@@ -1127,9 +1127,9 @@ class DynamicAreaDefinition(object):
     def compute_domain(
             self,
             corners: Sequence,
-            resolution: Optional[Union[float, tuple[float, float]]] = None,
+            resolution: None | float | tuple[float, float] = None,
             shape: Optional[tuple[int, int]] = None,
-            projection: Optional[Union[CRS, dict, str, int]] = None
+            projection: None | CRS | dict | str | int = None
     ):
         """Compute shape and area_extent from corners and [shape or resolution] info.
 
